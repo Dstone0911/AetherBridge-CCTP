@@ -1,0 +1,5 @@
+{
+  "name": "AetherBridge CCTP",
+  "description": "A high-fidelity simulation of a Cross-Chain Transfer Protocol (CCTP) bridge, enabling users to burn USDC on Testnet and mint on Mainnet with AI-powered transaction verification insights.",
+  "requestFramePermissions": []
+}
