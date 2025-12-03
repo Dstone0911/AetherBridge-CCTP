@@ -129,12 +129,38 @@ export const sendPlaceholderTransaction = async (from: string, network: Network,
   }
 };
 
-// Simulates a sponsored transaction (Meta-Tx) where a Paymaster handles gas.
-// We don't ask the user to sign a real ETH tx here, we just pretend it happened.
-export const sendSponsoredTransaction = async (from: string): Promise<string> => {
-  // Simulate network delay
-  await new Promise(resolve => setTimeout(resolve, 2000));
-  
-  // Return a mocked successful hash
-  return "0x" + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+// Simulates a sponsored gasless transaction using a signature (EIP-712 / Personal Sign style).
+// This provides a realistic "Paymaster" experience where the user signs a message instead of paying gas.
+export const signGaslessTransaction = async (from: string, action: string): Promise<string> => {
+  if (!window.ethereum) throw new Error("No wallet");
+
+  const message = `
+AetherBridge CCTP - Gasless Transaction Request
+
+Action: ${action}
+Sponsor: AetherBridge Paymaster Service
+Time: ${new Date().toLocaleString()}
+Nonce: ${Date.now()}
+
+Sign this message to authorize the transaction without paying gas.
+`;
+
+  try {
+    // Encode message to Hex to ensure compatibility with all wallets/providers
+    const msgHex = "0x" + Array.from(message).map(c => c.charCodeAt(0).toString(16)).join("");
+
+    await window.ethereum.request({
+      method: 'personal_sign',
+      params: [msgHex, from]
+    });
+    
+    // Simulate Relayer submission time
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    
+    // Return a realistic looking hash
+    return "0x" + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+  } catch (error: any) {
+    if (error.code === 4001) throw new Error("Signature rejected by user");
+    throw new Error("Gasless signature failed: " + error.message);
+  }
 };

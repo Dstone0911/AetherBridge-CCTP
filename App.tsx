@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Network, NetworkType, BridgeStage, Token } from './types';
-import { connectWallet, getChainId, switchNetwork, getUsdcBalance, sendPlaceholderTransaction, sendSponsoredTransaction } from './services/walletService';
+import { connectWallet, getChainId, switchNetwork, getUsdcBalance, sendPlaceholderTransaction, signGaslessTransaction } from './services/walletService';
 import { analyzeBridgeTransaction } from './services/geminiService';
 import NetworkBadge from './components/NetworkBadge';
 import ActivityChart from './components/ActivityChart';
@@ -33,6 +33,25 @@ const MAINNET: Network = {
   currency: 'ETH',
   usdcContract: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
 };
+
+// --- Helper Component: Robust Toggle ---
+const ToggleSwitch = ({ checked, onChange }: { checked: boolean, onChange: (v: boolean) => void }) => (
+  <button
+    type="button"
+    onClick={() => onChange(!checked)}
+    className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-600 focus-visible:ring-offset-2 ${
+      checked ? 'bg-emerald-500' : 'bg-slate-700'
+    }`}
+  >
+    <span className="sr-only">Use setting</span>
+    <span
+      aria-hidden="true"
+      className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+        checked ? 'translate-x-5' : 'translate-x-0'
+      }`}
+    />
+  </button>
+);
 
 // --- Main Component ---
 const App: React.FC = () => {
@@ -68,8 +87,14 @@ const App: React.FC = () => {
         window.ethereum.on('chainChanged', (chainIdHex: string) => {
            const id = parseInt(chainIdHex, 16);
            setCurrentChainId(id);
-           // Reloading is standard practice to avoid state inconsistency
-           window.location.reload(); 
+           
+           // CRITICAL FIX: Do NOT reload page, just update state.
+           // Reloading wipes the bridge transaction progress.
+           window.ethereum.request({ method: 'eth_accounts' }).then((accounts: string[]) => {
+             if (accounts.length > 0) {
+               fetchBalance(accounts[0], id);
+             }
+           });
         });
 
         // Check if already connected
@@ -111,7 +136,7 @@ const App: React.FC = () => {
   const handleSwitchToSepolia = async () => {
     try {
       await switchNetwork(TESTNET);
-      // chainChanged event will trigger reload/state update
+      // chainChanged event will trigger state update
     } catch (e: any) {
       setErrorMsg(e.message);
     }
@@ -123,7 +148,10 @@ const App: React.FC = () => {
     if (chainId !== TESTNET.chainId) {
       try {
         await switchNetwork(TESTNET);
-        // Return here, let the reload/useEffect handle the rest or user click again
+        // Wait for state to settle
+        await new Promise(r => setTimeout(r, 1000));
+        // We can continue or ask user to click again. 
+        // For better UX, let's ask them to click again to ensure balance loaded.
         return; 
       } catch (e: any) {
         setErrorMsg(e.message);
@@ -141,7 +169,12 @@ const App: React.FC = () => {
       
       // 3. Burn
       setStage(BridgeStage.BURNING);
-      const burnHash = await sendPlaceholderTransaction(walletAddress, TESTNET, `CCTP Burn: ${amount} USDC`);
+      let burnHash;
+      if (isSponsored) {
+        burnHash = await signGaslessTransaction(walletAddress, `Burn ${amount} USDC on Sepolia`);
+      } else {
+        burnHash = await sendPlaceholderTransaction(walletAddress, TESTNET, `CCTP Burn: ${amount} USDC`);
+      }
       setBurnTx(burnHash);
       
       // 4. AI Analysis
@@ -171,12 +204,14 @@ const App: React.FC = () => {
       const chainId = await getChainId();
       if (chainId !== MAINNET.chainId) {
         await switchNetwork(MAINNET);
+        // CRITICAL: Wait for provider to update after switch
+        await new Promise(resolve => setTimeout(resolve, 1500));
       }
 
       // 2. Mint
       let mintHash;
       if (isSponsored) {
-        mintHash = await sendSponsoredTransaction(walletAddress);
+        mintHash = await signGaslessTransaction(walletAddress, `Mint ${amount} USDC on Mainnet`);
       } else {
         mintHash = await sendPlaceholderTransaction(walletAddress, MAINNET, `CCTP Mint: ${amount} USDC`);
       }
@@ -184,8 +219,10 @@ const App: React.FC = () => {
       setMintTx(mintHash);
       setStage(BridgeStage.COMPLETED);
     } catch (e: any) {
+      console.error(e);
       setErrorMsg(e.message || "Minting failed");
-      setStage(BridgeStage.FAILED);
+      // If error, stay in waiting attestation or minting state depending on failure
+      setStage(BridgeStage.WAITING_ATTESTATION); 
     }
   };
 
@@ -197,18 +234,22 @@ const App: React.FC = () => {
     setAiInsight(null);
     setAmount('');
     setErrorMsg(null);
-    setIsSponsored(false);
-    window.location.reload(); // Hard reset to ensure network state is clean
+    // Don't reset isSponsored to allow user preference to persist across transfers
+    
+    // Refresh balance of current chain
+    window.ethereum.request({ method: 'eth_accounts' }).then((accounts: string[]) => {
+       if (accounts.length > 0) getChainId().then(id => fetchBalance(accounts[0], id));
+    });
   };
 
   const getButtonText = () => {
     switch (stage) {
-      case BridgeStage.IDLE: return 'Bridge Funds';
+      case BridgeStage.IDLE: return isSponsored ? 'Sign & Bridge' : 'Bridge Funds';
       case BridgeStage.CHECKING_NETWORK: return 'Switching Network...';
       case BridgeStage.APPROVING: return 'Approving Token...';
-      case BridgeStage.BURNING: return 'Sign Burn Transaction...';
+      case BridgeStage.BURNING: return isSponsored ? 'Signing Gasless Burn...' : 'Sign Burn Transaction...';
       case BridgeStage.WAITING_ATTESTATION: return 'Waiting for Attestation...';
-      case BridgeStage.MINTING: return 'Sign Mint Transaction...';
+      case BridgeStage.MINTING: return isSponsored ? 'Signing Gasless Mint...' : 'Sign Mint Transaction...';
       case BridgeStage.COMPLETED: return 'Transfer Complete';
       case BridgeStage.FAILED: return 'Retry';
       default: return 'Error';
@@ -347,24 +388,56 @@ const App: React.FC = () => {
              {/* Action Button */}
              <div className="mt-8">
                {stage === BridgeStage.IDLE || stage === BridgeStage.FAILED ? (
-                 <button 
-                   onClick={handleBridge}
-                   disabled={!walletAddress || !amount} 
-                   className={`w-full py-4 rounded-xl font-bold text-lg transition-all duration-200 ${
-                     !walletAddress || !amount
-                     ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
-                     : isWrongNetworkForStart
-                       ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-lg shadow-amber-600/20' // Warning color if wrong network but active
-                       : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 hover:shadow-indigo-600/40 transform hover:-translate-y-0.5'
-                   }`}
-                 >
-                   {!walletAddress 
-                     ? 'Connect Wallet to Bridge' 
-                     : isWrongNetworkForStart 
-                       ? 'Switch to Sepolia to Start'
-                       : 'Bridge USDC (Testnet → Mainnet)'
-                   }
-                 </button>
+                 <>
+                   {/* Gas Sponsorship Toggle for IDLE state - ROBUST IMPLEMENTATION */}
+                   <div className="mb-6 bg-indigo-900/20 border border-indigo-500/30 rounded-xl p-3 flex items-center justify-between shadow-sm">
+                       <div className="flex items-center gap-3">
+                           <div className={`p-2 rounded-lg ${isSponsored ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-700/50 text-slate-400'}`}>
+                               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5">
+                                   <path fillRule="evenodd" d="M12.963 2.286a.75.75 0 00-1.071-.136 9.742 9.742 0 00-3.539 6.177 7.547 7.547 0 01-1.705-1.715.75.75 0 00-1.152-.082A9 9 0 1015.68 4.534a7.46 7.46 0 01-2.717-2.248zM15.75 14.25a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0z" clipRule="evenodd" />
+                               </svg>
+                           </div>
+                           <div className="flex flex-col">
+                               <span className={`text-sm font-semibold ${isSponsored ? 'text-emerald-400' : 'text-slate-300'}`}>
+                                 {isSponsored ? 'Gas Sponsorship Active' : 'Sponsor Gas Fees'}
+                               </span>
+                               <span className="text-xs text-slate-400">Pay 0 ETH for transactions</span>
+                           </div>
+                       </div>
+                       
+                       <ToggleSwitch checked={isSponsored} onChange={setIsSponsored} />
+                   </div>
+
+                   <button 
+                     onClick={handleBridge}
+                     disabled={!walletAddress || !amount} 
+                     className={`w-full py-4 rounded-xl font-bold text-lg transition-all duration-200 relative overflow-hidden group ${
+                       !walletAddress || !amount
+                       ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                       : isWrongNetworkForStart
+                         ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-lg shadow-amber-600/20' // Warning color if wrong network but active
+                         : isSponsored
+                           ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-lg shadow-emerald-600/20'
+                           : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 hover:shadow-indigo-600/40 transform hover:-translate-y-0.5'
+                     }`}
+                   >
+                     {!walletAddress 
+                       ? 'Connect Wallet to Bridge' 
+                       : isWrongNetworkForStart 
+                         ? 'Switch to Sepolia to Start'
+                         : isSponsored
+                           ? 'Sign & Bridge (Gasless)'
+                           : 'Bridge USDC (Testnet → Mainnet)'
+                     }
+                     
+                     {/* Badge inside button */}
+                     {isSponsored && walletAddress && !isWrongNetworkForStart && amount && (
+                        <div className="absolute right-4 top-1/2 -translate-y-1/2 bg-white/20 px-2 py-0.5 rounded text-xs uppercase tracking-wider font-semibold">
+                          Gasless
+                        </div>
+                     )}
+                   </button>
+                 </>
                ) : (
                   <div className="space-y-4">
                     {/* Status Bar */}
@@ -377,35 +450,38 @@ const App: React.FC = () => {
 
                     {canMint && (
                       <div className="space-y-3">
-                         <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 text-amber-500 text-sm flex gap-2 items-start">
-                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 flex-shrink-0 mt-0.5">
-                              <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
-                            </svg>
-                            <div>
-                               <strong>Mainnet Gas Warning:</strong><br/>
-                               Interacting with Mainnet costs real ETH.
-                               <div className="mt-2 flex items-center gap-2">
-                                  <label className="flex items-center gap-2 cursor-pointer bg-slate-900/50 px-3 py-1.5 rounded-lg border border-slate-700 hover:border-indigo-500/50 transition-colors">
-                                    <input 
-                                      type="checkbox" 
-                                      checked={isSponsored} 
-                                      onChange={(e) => setIsSponsored(e.target.checked)}
-                                      className="form-checkbox h-4 w-4 text-indigo-600 rounded bg-slate-800 border-slate-600 focus:ring-offset-0 focus:ring-0" 
-                                    />
-                                    <span className="text-white font-medium">Sponsor Gas Fees (Simulated Paymaster)</span>
-                                  </label>
-                               </div>
+                         <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 text-amber-500 text-sm">
+                            <div className="flex gap-2 items-start mb-3">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 flex-shrink-0 mt-0.5">
+                                  <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+                                </svg>
+                                <div>
+                                   <strong>Mainnet Gas Required</strong>
+                                   <p className="mt-1 text-amber-500/80 text-xs">Usually requires ETH. Enable sponsorship to skip fees.</p>
+                                </div>
+                            </div>
+                            
+                            <div className="bg-slate-900/40 rounded-lg p-3 flex items-center justify-between">
+                                 <span className={`font-medium ml-1 ${isSponsored ? 'text-emerald-400' : 'text-slate-300'}`}>
+                                    {isSponsored ? 'Gas Sponsorship Active' : 'Sponsor Gas Fees'}
+                                 </span>
+                                 <ToggleSwitch checked={isSponsored} onChange={setIsSponsored} />
                             </div>
                          </div>
                          <button 
                            onClick={handleMint}
-                           className={`w-full py-4 rounded-xl font-bold text-lg text-white shadow-lg transition-all ${
+                           className={`w-full py-4 rounded-xl font-bold text-lg text-white shadow-lg transition-all relative overflow-hidden ${
                              isSponsored 
                                ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-emerald-600/20' 
                                : 'bg-green-600 hover:bg-green-500 shadow-green-600/20'
                            }`}
                          >
-                           {isSponsored ? 'Mint (Free via Paymaster)' : 'Mint on Mainnet'}
+                           {isSponsored ? 'Sign to Mint (Gasless)' : 'Mint on Mainnet'}
+                           {isSponsored && (
+                              <div className="absolute right-4 top-1/2 -translate-y-1/2 bg-white/20 px-2 py-0.5 rounded text-xs uppercase tracking-wider font-semibold">
+                                Free
+                              </div>
+                           )}
                          </button>
                       </div>
                     )}
@@ -424,7 +500,7 @@ const App: React.FC = () => {
 
              {/* Footer Info */}
              <div className="mt-6 flex justify-between text-xs text-slate-500">
-               <span>Network Fee: {isSponsored ? 'Sponsored' : 'ETH Gas'}</span>
+               <span>Network Fee: <span className={isSponsored ? "text-emerald-400 font-medium" : ""}>{isSponsored ? 'Sponsored (0 ETH)' : 'Standard (ETH Gas)'}</span></span>
                <span>Mode: Live Test (Simulated CCTP)</span>
              </div>
           </div>
