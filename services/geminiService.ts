@@ -1,3 +1,4 @@
+
 import { GoogleGenAI } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -9,7 +10,8 @@ export const analyzeBridgeTransaction = async (
   txHash: string
 ): Promise<string> => {
   try {
-    const modelId = "gemini-2.5-flash";
+    // Using gemini-3-flash-preview for basic text analysis tasks
+    const modelId = "gemini-3-flash-preview";
     const prompt = `
       You are a blockchain security auditor AI for the CCTP (Cross-Chain Transfer Protocol).
       A user is bridging ${amount} USDC from ${sourceNet} to ${destNet}.
@@ -27,6 +29,7 @@ export const analyzeBridgeTransaction = async (
       contents: prompt,
     });
 
+    // response.text is a property, not a method
     return response.text || "Transaction analysis unavailable.";
   } catch (error) {
     console.error("Gemini analysis failed:", error);
